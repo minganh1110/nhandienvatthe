@@ -13,7 +13,7 @@ if not os.path.exists(EAST_MODEL):
 
 net = cv2.dnn.readNet(EAST_MODEL)
 
-# --- Hàm tính độ sắc nét ---
+# --- Hàm tính độ sắc nét --
 def sharpness_score(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()

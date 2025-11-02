@@ -13,8 +13,8 @@ from openpyxl import Workbook, load_workbook
 
 # ================== DEFAULT CONFIG (override bởi settings.json) ==================
 EXCEL_FILE_DEFAULT   = r"C:\toollinkanh\nhandienvatthe\link.xlsx"
-DOWNLOAD_DIR_DEFAULT = r"C:\toollinkanh\nhandienvatthe\imgdownload\fileanhtam"
-IMG_DONE_DIR_DEFAULT = r"C:\toollinkanh\nhandienvatthe\imgdone"  # để chứa result_xlsx
+DOWNLOAD_DIR_DEFAULT = r"C:\Users\ADMIN\Downloads\fileanhtam"
+IMG_DONE_DIR_DEFAULT = r"C:\toollinkanh\nhandienvatthe\imgdone"
 RESULT_XLSX_DEFAULT  = str(Path(IMG_DONE_DIR_DEFAULT) / "result_links.xlsx")
 
 CHROME_EXE           = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
@@ -22,17 +22,16 @@ USER_DATA_DIR        = r"C:\Users\dell\AppData\Local\Google\Chrome\User Data"
 PROFILE_DIR_DEFAULT  = "Profile 47"
 
 CONF_THRES   = 0.5
-IDEAL_RATIO  = 0.4           # không còn dùng để chấm điểm, giữ lại nếu sau này cần
-OPEN_LINK_DELAY = 3.2        # tăng để trang kịp khởi động
-MAX_WAIT_DL     = 120        # tăng timeout tổng đợi ảnh
-QUIET_SECONDS   = 2.0        # cần yên lặng đủ lâu mới "chốt" bộ ảnh
+IDEAL_RATIO  = 0.4
+OPEN_LINK_DELAY = 3.2
+MAX_WAIT_DL     = 120
+QUIET_SECONDS   = 2.0
 IMG_EXTS        = (".jpg", ".jpeg", ".png", ".webp")
 CLOSE_TAB_EACH_ROUND = True
 
-# ====== EAST (text detector) — YÊU CẦU BẮT BUỘC như file 2 ======
+# ====== EAST (text detector) — load once ======
 EAST_MODEL = "frozen_east_text_detection.pb"
 if not os.path.exists(EAST_MODEL):
-    # Giống file 2: thiếu model -> raise luôn
     raise FileNotFoundError("❌ Không tìm thấy file 'frozen_east_text_detection.pb' trong thư mục hiện tại!")
 NET_EAST = cv2.dnn.readNet(EAST_MODEL)
 
@@ -70,7 +69,7 @@ def save_settings(d):
 # ================== FILE / EXCEL helpers ==================
 def ensure_dirs(download_dir, img_done_dir):
     os.makedirs(download_dir, exist_ok=True)
-    os.makedirs(img_done_dir, exist_ok=True)  # để chứa result_xlsx
+    os.makedirs(img_done_dir, exist_ok=True)
 
 def clear_download_dir(download_dir):
     for pattern in [*[f"*{ext}" for ext in IMG_EXTS], "*.crdownload"]:
@@ -90,19 +89,13 @@ def excel_ensure(path):
         excel_init(path)
 
 def excel_next_stt(path):
-    """
-    Trả về STT kế tiếp. Header ở dòng 1, nên:
-    - Khi chưa có dữ liệu: ws.max_row = 1 -> STT = 1
-    - Khi đã có N dòng dữ liệu: ws.max_row = 1+N -> STT = N+1
-    """
     excel_ensure(path)
     wb = load_workbook(path); ws = wb.active
-    n = ws.max_row  # header=1
+    n = ws.max_row
     wb.close()
-    return n  # STT = max_row (vì header chiếm dòng 1)
+    return n
 
 def excel_append_row(path, row3):
-    """row3 = [stt, link, stt_anh]"""
     excel_ensure(path)
     wb = load_workbook(path); ws = wb.active
     ws.append(row3); wb.save(path); wb.close()
@@ -128,19 +121,12 @@ def has_crdownload(dirpath):
     return bool(glob.glob(os.path.join(dirpath, "*.crdownload")))
 
 def wait_download_batch(download_dir, timeout=120, quiet_seconds=8.0):
-    """
-    Đợi đến khi thư mục tải không thay đổi ít nhất 'quiet_seconds'.
-    Sau đó chờ thêm 1s (grace) để tránh thiếu ảnh, rồi chốt danh sách.
-    """
     t0 = time.time()
     last_sig, last_change = None, time.time()
-
     def snapshot():
         fs = list_images(download_dir)
-        # chữ ký = (tên, size) sắp xếp để ổn định
         sig = tuple(sorted((os.path.basename(p).lower(), os.path.getsize(p)) for p in fs))
         return fs, sig
-
     while time.time() - t0 < timeout:
         if has_crdownload(download_dir):
             last_sig = None; last_change = time.time()
@@ -150,13 +136,13 @@ def wait_download_batch(download_dir, timeout=120, quiet_seconds=8.0):
             last_sig, last_change = sig, time.time()
         else:
             if time.time() - last_change >= quiet_seconds:
-                time.sleep(1.0)  # grace delay
+                time.sleep(1.0)
                 return list_images(download_dir)
         time.sleep(0.3)
     return list_images(download_dir)
 
-# ================== TEXT RATIO (EAST) — giống file 2 ==================
-def text_ratio(img, conf_threshold=0.5):
+# ================== TEXT RATIO (EAST) ==================
+def text_ratio_east(img, conf_threshold=0.5):
     """Tỷ lệ vùng chữ 0..1 (EAST)."""
     h, w = img.shape[:2]
     new_w, new_h = 320, 320
@@ -196,56 +182,123 @@ def text_ratio(img, conf_threshold=0.5):
     return min(1.0, text_area / float(h*w))
 
 EPS = 1e-6
-
 def stable_key(p):
-    """Khóa sắp xếp ổn định theo tên+size (không dựa vào mtime)."""
     try:
         return (os.path.basename(p).lower(), os.path.getsize(p))
     except Exception:
         return (os.path.basename(p).lower(), 0)
 
-# ================== SCORING CHUẨN FILE 2: chỉ dựa vào ít chữ ==================
-def score_and_pick(files):
-    """
-    Ưu tiên duy nhất: ảnh ít chữ (1 - text_ratio).
-    Tie-break ổn định: text_ratio nhỏ hơn -> tên file (stable_key).
-    Trả về (best_path, idx_in_files_sorted, text_ratio_value).
-    """
-    if not files:
-        return (None, 0, 1.0)
+# ================== YOLO (ultralytics) ==================
+from ultralytics import YOLO
+YOLO_MODEL_PATH = "yolov8n.pt"
+if not os.path.exists(YOLO_MODEL_PATH):
+    raise FileNotFoundError("❌ Không tìm thấy file YOLO model (.pt)!")
+MODEL_YOLO = YOLO(YOLO_MODEL_PATH)
 
-    files_sorted = sorted(files, key=stable_key)  # cố định thứ tự
-    best = None  # (p, score, t)
+# --- Hàm tính độ sắc nét ---
+def sharpness_score(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
 
-    for p in files_sorted:
+
+# --- Hàm đánh giá độ tập trung vào vật thể ---
+def focus_ratio_from_result(result, img_shape, conf_thresh=0.5):
+    h, w = img_shape[:2]
+    total_area = w * h
+    object_areas = []
+
+    try:
+        for box in result.boxes:
+            conf = float(box.conf[0]) if hasattr(box, "conf") else 0.0
+            if conf >= conf_thresh:
+                xy = box.xyxy[0]  # [x1, y1, x2, y2]
+                x1, y1, x2, y2 = map(int, xy.tolist())
+                area = max(0, x2 - x1) * max(0, y2 - y1)
+                object_areas.append(area)
+    except Exception:
+        pass
+
+    if not object_areas:
+        return 0.0
+
+    main_area = max(object_areas)
+    main_ratio = main_area / float(total_area + EPS)
+    object_count = len(object_areas)
+
+    # --- Tính điểm tập trung ---
+    ideal_focus = IDEAL_RATIO  # ví dụ: 0.3
+    focus_score = max(0.0, 1.0 - abs(main_ratio - ideal_focus))
+    clutter_penalty = 1.0 / (1.0 + (object_count - 1) * 2.0)
+    return focus_score * clutter_penalty
+
+
+# --- Hàm chấm điểm & chọn ảnh tốt nhất ---
+def score_and_pick(file_list):
+    """
+    Trả về (best_path, best_idx, best_text_ratio)
+    Nếu không chọn được ảnh hợp lệ → (None, 0, 0.0)
+    """
+    best_score = -1e9
+    best_path = None
+    best_idx = 0
+    best_tr = 0.0
+
+    for i, p in enumerate(file_list, start=1):
+        # --- Đọc ảnh ---
         try:
-            img = cv2.imread(p)
-            if img is None:
-                continue
-            t = text_ratio(img)
-            sc = 1.0 - t                    # chỉ ít chữ
-            cand = (p, sc, t)
-
-            if best is None:
-                best = cand
-            else:
-                bp, bsc, bt = best
-                if sc > bsc + EPS:
-                    best = cand
-                elif abs(sc - bsc) <= EPS:
-                    if t < bt - EPS:        # ít chữ hơn
-                        best = cand
-                    elif abs(t - bt) <= EPS:
-                        if stable_key(p) < stable_key(bp):  # tên file
-                            best = cand
+            img_bgr = cv2.imdecode(np.fromfile(p, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                from PIL import Image
+                pil = Image.open(p).convert("RGB")
+                img_bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
         except Exception:
             continue
 
-    if best is None:
-        return (None, 0, 1.0)
+        # --- Tính tỉ lệ chữ ---
+        try:
+            tr = text_ratio_east(img_bgr, conf_threshold=0.5)
+        except Exception:
+            tr = 1.0  # lỗi detector → coi như có nhiều chữ
 
-    best_idx = files_sorted.index(best[0]) + 1
-    return (best[0], best_idx, best[2])
+        # --- Tính độ nét ---
+        try:
+            sharp = sharpness_score(img_bgr)
+        except Exception:
+            sharp = 0.0
+
+        # --- Phát hiện vật thể bằng YOLO ---
+        try:
+            res = MODEL_YOLO(p)
+            r0 = res[0] if len(res) > 0 else None
+        except Exception:
+            r0 = None
+
+        # --- Tính độ tập trung ---
+        focus = 0.0
+        if r0 is not None:
+            try:
+                focus = focus_ratio_from_result(r0, img_bgr, conf_thresh=CONF_THRES)
+            except Exception:
+                focus = 0.0
+
+        # --- Tính điểm tổng hợp ---
+        sharp_scaled = np.log1p(max(0.0, sharp))  # log(1 + var)
+        score = (
+            (1.0 - tr) * 0.6   # ít chữ càng tốt
+            + focus * 0.35     # tập trung vật thể
+            + (sharp_scaled / (sharp_scaled + 1e-6)) * 0.05  # nét
+        )
+
+        # --- Chọn ảnh tốt nhất ---
+        if score > best_score:
+            best_score = score
+            best_path = p
+            best_idx = i
+            best_tr = tr
+
+    if best_path is None:
+        return None, 0, 0.0
+    return best_path, best_idx, best_tr
 
 # ================== OPEN LINK ==================
 def open_in_chrome(url, profile_dir_name):
@@ -291,7 +344,6 @@ class RunnerThread(threading.Thread):
             self.ui.log("… đợi ảnh ổn định trong thư mục download…")
             files = wait_download_batch(s["download_dir"], MAX_WAIT_DL, QUIET_SECONDS)
 
-            # Lấy STT cho dòng Excel này
             stt = excel_next_stt(s["result_xlsx"])
 
             if not files:
@@ -299,7 +351,6 @@ class RunnerThread(threading.Thread):
                 excel_append_row(s["result_xlsx"], [stt, link, 0])
                 continue
 
-            # sắp xếp ổn định & chọn ảnh (ít chữ nhất)
             files = sorted(files, key=stable_key)
             best_path, best_idx, t_ratio = score_and_pick(files)
 
@@ -307,7 +358,6 @@ class RunnerThread(threading.Thread):
                 self.ui.log("  ❌ Không chọn được ảnh.")
                 excel_append_row(s["result_xlsx"], [stt, link, 0])
             else:
-                # === PREVIEW IN-MEMORY: đọc ảnh vào RAM rồi dọn file ngay ===
                 try:
                     im = Image.open(best_path).convert("RGB")
                     self.ui.show_preview_image(im)
@@ -317,10 +367,8 @@ class RunnerThread(threading.Thread):
                 self.ui.log(f"  ✔ Ảnh #{best_idx} (tỷ lệ chữ ~ {t_ratio:.2f})")
                 excel_append_row(s["result_xlsx"], [stt, link, best_idx])
 
-            # dọn download cho vòng sau (an toàn vì preview đã ở RAM)
             clear_download_dir(s["download_dir"])
 
-            # đóng tab
             if CLOSE_TAB_EACH_ROUND:
                 self.ui.try_close_tab()
 
@@ -331,7 +379,6 @@ class RunnerThread(threading.Thread):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        # DPI aware (Windows)
         try:
             if sys.platform.startswith("win"):
                 import ctypes
@@ -344,7 +391,6 @@ class App(tk.Tk):
 
         self.settings = load_settings()
 
-        # ---------- Layout ----------
         root = ttk.Frame(self); root.pack(fill="both", expand=True)
         root.columnconfigure(0, weight=0)
         root.columnconfigure(1, weight=1)
@@ -357,7 +403,6 @@ class App(tk.Tk):
         right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
 
-        # ============ LEFT ============
         ttk.Label(left, text="Cấu hình", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=(10,6), columnspan=3)
 
         self.var_excel = tk.StringVar(value=self.settings["excel_file"])
@@ -381,7 +426,6 @@ class App(tk.Tk):
         ttk.Button(btns, text="🧹 Clear file", command=self.clear_all).pack(side="left", padx=3)
         ttk.Button(btns, text="↺ Reset",      command=self.reset_tool).pack(side="left", padx=3)
 
-        # Log (nền không-đen)
         ttk.Label(left, text="Log:").grid(row=6, column=0, sticky="w", padx=10)
         logwrap = ttk.Frame(left); logwrap.grid(row=7, column=0, sticky="nsew", padx=10, pady=(0,10))
         left.rowconfigure(7, weight=1)
@@ -396,26 +440,22 @@ class App(tk.Tk):
         self.txt.configure(yscrollcommand=vsb.set)
         self.txt.pack(side="left", fill="both", expand=True); vsb.pack(side="right", fill="y")
 
-        # ============ RIGHT: preview ============
         ttk.Label(right, text="Preview ảnh chọn", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=(10,6))
         self.preview_canvas = tk.Canvas(right, bg="#202020", highlightthickness=0)
         self.preview_canvas.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
-        self.preview_img = None      # PIL Image trong RAM
-        self.preview_imgtk = None    # ImageTk để vẽ
+        self.preview_img = None
+        self.preview_imgtk = None
         self.preview_canvas.bind("<Configure>", self._redraw_preview)
 
         self.queue = queue.Queue()
         self.runner = None
         self.after(80, self.drain_queue)
 
-    # -------- preview helpers --------
     def _redraw_preview(self, _evt=None):
         self.preview_canvas.delete("all")
         cw, ch = self.preview_canvas.winfo_width(), self.preview_canvas.winfo_height()
         if not self.preview_img:
-            self.preview_canvas.create_text(
-                cw/2, ch/2, text="(Chưa có ảnh chọn)", fill="#888"
-            )
+            self.preview_canvas.create_text(cw/2, ch/2, text="(Chưa có ảnh chọn)", fill="#888")
             return
         try:
             im = self.preview_img.copy()
@@ -426,11 +466,9 @@ class App(tk.Tk):
             self.preview_canvas.create_text(10,10, anchor="nw", text=f"Lỗi ảnh: {e}", fill="#f66")
 
     def show_preview_image(self, pil_image):
-        """Nhận PIL Image (đã đọc từ file), set vào RAM và vẽ ngay."""
         self.preview_img = pil_image.copy()
         self._redraw_preview()
 
-    # -------- queue & log --------
     def log(self, msg): self.queue.put(msg)
 
     def drain_queue(self):
@@ -442,7 +480,6 @@ class App(tk.Tk):
             pass
         self.after(80, self.drain_queue)
 
-    # -------- buttons / actions --------
     def pick_excel(self):
         f = filedialog.askopenfilename(title="Chọn file Excel", filetypes=[("Excel", "*.xlsx")])
         if f:
@@ -475,7 +512,6 @@ class App(tk.Tk):
     def start_run(self):
         if self.runner and self.runner.is_alive(): return
         self.settings["excel_file"]  = self.var_excel.get().strip()
-        # vẫn để result_xlsx trong img_done_dir
         self.settings["result_xlsx"] = str(Path(self.settings["img_done_dir"]) / "result_links.xlsx")
         save_settings(self.settings)
         self.txt.delete("1.0", "end")

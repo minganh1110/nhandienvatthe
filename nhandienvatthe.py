@@ -6,18 +6,83 @@ import cv2
 import os
 import numpy as np
 
+# --- Tải model phát hiện chữ EAST ---
+EAST_MODEL = "frozen_east_text_detection.pb"
+if not os.path.exists(EAST_MODEL):
+    raise FileNotFoundError("❌ Không tìm thấy file 'frozen_east_text_detection.pb' trong thư mục hiện tại!")
+
+net = cv2.dnn.readNet(EAST_MODEL)
+
 # --- Hàm tính độ sắc nét ---
 def sharpness_score(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
+# --- Hàm tính tỷ lệ vùng chứa chữ (0 → ít chữ, 1 → nhiều chữ) ---
+def text_ratio(img, conf_threshold=0.5):
+    h, w = img.shape[:2]
+    new_w, new_h = (320, 320)
+    rW, rH = w / float(new_w), h / float(new_h)
+
+    blob = cv2.dnn.blobFromImage(
+        cv2.resize(img, (new_w, new_h)),
+        1.0,
+        (new_w, new_h),
+        (123.68, 116.78, 103.94),
+        swapRB=True,
+        crop=False
+    )
+
+    net.setInput(blob)
+    (scores, geometry) = net.forward(["feature_fusion/Conv_7/Sigmoid", "feature_fusion/concat_3"])
+    (numRows, numCols) = scores.shape[2:4]
+
+    boxes = []
+    confidences = []
+
+    for y in range(numRows):
+        scoresData = scores[0, 0, y]
+        xData0 = geometry[0, 0, y]
+        xData1 = geometry[0, 1, y]
+        xData2 = geometry[0, 2, y]
+        xData3 = geometry[0, 3, y]
+        anglesData = geometry[0, 4, y]
+
+        for x in range(numCols):
+            if scoresData[x] < conf_threshold:
+                continue
+            offsetX, offsetY = x * 4.0, y * 4.0
+            angle = anglesData[x]
+            cos = np.cos(angle)
+            sin = np.sin(angle)
+            h_box = xData0[x] + xData2[x]
+            w_box = xData1[x] + xData3[x]
+            endX = int(offsetX + (cos * xData1[x]) + (sin * xData2[x]))
+            endY = int(offsetY - (sin * xData1[x]) + (cos * xData2[x]))
+            startX = int(endX - w_box)
+            startY = int(endY - h_box)
+            boxes.append((startX, startY, endX, endY))
+            confidences.append(float(scoresData[x]))
+
+    indices = cv2.dnn.NMSBoxes(
+        [cv2.boundingRect(np.array([[x1, y1], [x2, y2]])) for (x1, y1, x2, y2) in boxes],
+        confidences, conf_threshold, 0.4
+    )
+
+    total_area = w * h
+    text_area = 0
+    if len(indices) > 0:
+        for i in indices.flatten():
+            (x1, y1, x2, y2) = boxes[i]
+            text_area += max(0, (x2 - x1)) * max(0, (y2 - y1))
+
+    return text_area / total_area  # Tỷ lệ vùng chữ
 
 # --- Hàm đánh giá độ tập trung vào vật thể ---
 def focus_ratio(result, img_shape):
     h, w, _ = img_shape
     total_area = w * h
     object_areas = []
-    total_obj_area = 0
 
     for box in result.boxes:
         conf = float(box.conf[0])
@@ -25,7 +90,6 @@ def focus_ratio(result, img_shape):
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             area = (x2 - x1) * (y2 - y1)
             object_areas.append(area)
-            total_obj_area += area
 
     if not object_areas:
         return 0
@@ -37,15 +101,13 @@ def focus_ratio(result, img_shape):
     ideal_focus = 0.4
     focus_score = max(0, 1 - abs(main_ratio - ideal_focus))
     clutter_penalty = 1 / (1 + (object_count - 1) * 2)
-
     return focus_score * clutter_penalty
-
 
 # --- Giao diện chính ---
 class ObjectFocusApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Chọn ảnh tập trung vào vật thể nhất")
+        self.root.title("Chọn ảnh tập trung vào vật thể nhất (ưu tiên ít chữ)")
         self.root.geometry("1000x700")
         self.root.configure(bg="#f5f5f5")
         self.model = YOLO("yolov8n.pt")
@@ -77,15 +139,11 @@ class ObjectFocusApp:
         self.thumb_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.create_window((0, 0), window=self.thumb_frame, anchor="nw")
         self.canvas.configure(xscrollcommand=self.scrollbar.set)
-
         self.canvas.pack(side="top", fill="x", expand=True)
         self.scrollbar.pack(side="bottom", fill="x")
 
     def open_images(self):
-        paths = filedialog.askopenfilenames(
-            title="Chọn ảnh",
-            filetypes=[("Image files", "*.jpg;*.jpeg;*.png")]
-        )
+        paths = filedialog.askopenfilenames(title="Chọn ảnh", filetypes=[("Image files", "*.jpg;*.jpeg;*.png")])
         if paths:
             self.image_paths = list(paths)
             self.display_thumbnails()
@@ -94,7 +152,6 @@ class ObjectFocusApp:
     def display_thumbnails(self):
         for widget in self.thumb_frame.winfo_children():
             widget.destroy()
-
         self.thumbnails.clear()
         for path in self.image_paths:
             try:
@@ -113,27 +170,27 @@ class ObjectFocusApp:
             messagebox.showwarning("Cảnh báo", "Vui lòng chọn ảnh trước.")
             return
 
-        results = []
+        scored_images = []
         for path in self.image_paths:
             img = cv2.imread(path)
             if img is None:
                 continue
 
-            # --- KHÔNG kiểm tra ảnh có chữ nữa ---
-            result = self.model(path, verbose=False)[0]
-            ratio = focus_ratio(result, img.shape)
-            sharp = sharpness_score(img)
+            # Tính tỷ lệ vùng chữ
+            t_ratio = text_ratio(img)
 
-            score = (ratio * 1000) + (sharp * 0.05)
-            results.append((path, score))
+            # Ảnh có ít chữ => điểm cao
+            score = 1 - t_ratio
+            scored_images.append((path, score, t_ratio))
 
-        if not results:
-            messagebox.showinfo("Kết quả", "Không tìm thấy ảnh hợp lệ.")
-            return
+        # Chọn ảnh có t_ratio nhỏ nhất (ít chữ nhất)
+        best_image, best_score, best_text_ratio = max(scored_images, key=lambda x: x[1])
 
-        best_image = max(results, key=lambda x: x[1])[0]
         self.display_image(best_image)
-        self.result_label.config(text=f"Ảnh tập trung vào vật thể nhất: {os.path.basename(best_image)}")
+        self.result_label.config(
+            text=f"Ảnh có chữ ít nhất: {os.path.basename(best_image)} (tỷ lệ chữ: {best_text_ratio:.2%})"
+        )
+
 
     def display_image(self, path):
         img = Image.open(path)
@@ -143,13 +200,11 @@ class ObjectFocusApp:
         self.image_panel.image = img_tk
 
     def clear_all(self):
-        self.image_paths = []
-        self.thumbnails.clear()
+        self.image_paths.clear()
         for widget in self.thumb_frame.winfo_children():
             widget.destroy()
         self.image_panel.config(image='')
         self.result_label.config(text="Đã xóa tất cả ảnh.")
-
 
 if __name__ == "__main__":
     root = tk.Tk()

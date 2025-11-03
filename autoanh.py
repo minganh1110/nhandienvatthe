@@ -25,7 +25,7 @@ CONF_THRES   = 0.5
 IDEAL_RATIO  = 0.4
 OPEN_LINK_DELAY = 3.2
 MAX_WAIT_DL     = 120
-QUIET_SECONDS   = 2.0
+QUIET_SECONDS   = 4.0
 IMG_EXTS        = (".jpg", ".jpeg", ".png", ".webp")
 CLOSE_TAB_EACH_ROUND = True
 
@@ -242,9 +242,6 @@ def is_sensitive_image(path):
     if (porn > 0.6 or sexy > 0.6 or hentai > 0.6) and skin > 0.2:
         print(f"🚫 Ảnh nhạy cảm bị loại: {os.path.basename(path)} ({result}, skin={skin:.2f})")
         return True
-    if skin > 0.45:
-        print(f"🚫 Ảnh có vùng da lớn ({skin*100:.1f}%) => loại")
-        return True
     return False
 
 
@@ -305,28 +302,31 @@ def text_ratio(img, conf_threshold=0.5):
 # ================== CHỌN ẢNH TỐT NHẤT ==================
 def score_and_pick(file_list):
     """
-    Trả về (best_path, best_score, best_text_ratio)
+    Chọn ảnh tốt nhất trong danh sách.
+    Nếu phát hiện BẤT KỲ ảnh nhạy cảm nào -> bỏ qua toàn bộ link (trả về None).
     """
     best_score = -1e9
     best_path = None
     best_tr = 0.0
 
     for p in file_list:
-        if is_sensitive_image(p):  # loại ảnh nhạy cảm
-            continue
+        # --- Nếu có ảnh nhạy cảm thì dừng luôn ---
+        if is_sensitive_image(p):
+            print(f"🚫 Phát hiện ảnh nhạy cảm ({os.path.basename(p)}), bỏ qua toàn bộ link này.")
+            return None, -1, -1
 
         try:
             img = cv2.imread(p)
             if img is None:
                 continue
 
+            # --- Tính tỉ lệ chữ, độ sắc nét, vật thể ---
             tr = text_ratio(img)
             sharp = sharpness_score(img)
             focus = focus_ratio(img)
-
-            # scale điểm sắc nét (log để tránh lệch)
             sharp_scaled = np.log1p(max(0.0, sharp))
 
+            # --- Công thức tính điểm tổng ---
             score = (
                 (1.0 - tr) * 0.6 +      # ít chữ
                 focus * 0.35 +          # tập trung vật thể
@@ -343,9 +343,6 @@ def score_and_pick(file_list):
         except Exception as e:
             print(f"❌ Lỗi xử lý {p}: {e}")
 
-    if best_path is None:
-        print("❌ Không tìm thấy ảnh phù hợp.")
-        return None, 0.0, 0.0
     return best_path, best_score, best_tr
 
 # ================== OPEN LINK ==================

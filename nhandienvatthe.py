@@ -72,16 +72,31 @@ def is_sensitive_image(path):
         preds = predict.classify(NSFW_MODEL, path)
         result = preds[path]
         img = cv2.imread(path)
-        skin = skin_ratio(img)
+        if img is None:
+            return False
 
-        # chỉ loại nếu model nghi ngờ và vùng da > 40%
-        if (result["porn"] > 0.7 or result["sexy"] > 0.75) and skin > 0.4:
-            print(f"🚫 Ảnh nhạy cảm bị loại: {os.path.basename(path)} ({result})")
+        skin = skin_ratio(img)
+        porn = result.get("porn", 0)
+        sexy = result.get("sexy", 0)
+        hentai = result.get("hentai", 0)
+
+        # --- Mức nhạy cảm vừa phải ---
+        # Ảnh có yếu tố gợi cảm hoặc hở da nhiều thì loại
+        if (porn > 0.6 or sexy > 0.6 or hentai > 0.6) and skin > 0.2:
+            print(f"🚫 Ảnh nhạy cảm bị loại: {os.path.basename(path)} ({result}, skin={skin:.2f})")
             return True
+
+        # Ảnh quá nhiều vùng da (như mặc bikini, đồ lót)
+        if skin > 0.45:
+            print(f"🚫 Ảnh có vùng da lớn ({skin*100:.1f}%) => loại")
+            return True
+
+        return False
 
     except Exception as e:
         print(f"⚠️ Lỗi khi phân loại ảnh {path}: {e}")
-    return False
+        return False
+
 
 
 # --- Hàm tính độ sắc nét ---
@@ -237,6 +252,7 @@ class ObjectFocusApp:
                 continue
 
     # === Chọn ảnh có chữ ít nhất (và dừng nếu nhạy cảm) ===
+    
     def predict_best(self):
         if not self.image_paths:
             messagebox.showwarning("Thông báo", "Vui lòng chọn ảnh trước!")
